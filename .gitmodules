@@ -1,0 +1,3 @@
+[submodule "RADIO-ViPE"]
+	path = third_party/RADIO-ViPE
+	url = https://github.com/be2rlab/RADIO-ViPE.git
