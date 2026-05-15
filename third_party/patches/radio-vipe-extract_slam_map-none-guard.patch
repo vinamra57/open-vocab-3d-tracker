@@ -1,0 +1,16 @@
+diff --git a/vipe/slam/components/buffer.py b/vipe/slam/components/buffer.py
+index e3267fd..964a47e 100644
+--- a/vipe/slam/components/buffer.py
++++ b/vipe/slam/components/buffer.py
+@@ -905,7 +905,10 @@ class GraphBuffer:
+             images,
+             torch.stack(mask_list, dim=1),
+             self.tstamp[t_range],
+-            staged_emb[...].permute(0,1,3,4,2),
++            # Guard against videos that produced no RADSeg embeddings (e.g. when
++            # bundle adjustment diverges): staged_emb is None in that case, and
++            # from_masked_dense_disp already accepts embeddings=None.
++            staged_emb[...].permute(0, 1, 3, 4, 2) if staged_emb is not None else None,
+             staged_valid,
+         )
+ 
