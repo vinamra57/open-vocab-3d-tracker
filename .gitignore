@@ -1,0 +1,6 @@
+output/*
+!output/.gitkeep
+
+# Downloaded model weights (TORCH_HOME for step1 / RADIO-ViPE checkpoints)
+.cache/
+third_party/checkpoints/
