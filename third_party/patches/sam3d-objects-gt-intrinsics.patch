@@ -1,0 +1,74 @@
+diff --git a/notebook/inference.py b/notebook/inference.py
+index 94e99a7..68722e5 100644
+--- a/notebook/inference.py
++++ b/notebook/inference.py
+@@ -104,6 +104,7 @@ class Inference:
+         mask: Optional[Union[None, Image.Image, np.ndarray]],
+         seed: Optional[int] = None,
+         pointmap=None,
++        intrinsics=None,
+     ) -> dict:
+         image = self.merge_mask_to_rgba(image, mask)
+         return self._pipeline.run(
+@@ -117,6 +118,7 @@ class Inference:
+             use_vertex_color=True,
+             stage1_inference_steps=None,
+             pointmap=pointmap,
++            intrinsics=intrinsics,
+         )
+ 
+ 
+diff --git a/sam3d_objects/pipeline/inference_pipeline_pointmap.py b/sam3d_objects/pipeline/inference_pipeline_pointmap.py
+index f557834..0f909d7 100644
+--- a/sam3d_objects/pipeline/inference_pipeline_pointmap.py
++++ b/sam3d_objects/pipeline/inference_pipeline_pointmap.py
+@@ -259,7 +259,7 @@ class InferencePipelinePointMap(InferencePipeline):
+ 
+         return revised_scale
+ 
+-    def compute_pointmap(self, image, pointmap=None):
++    def compute_pointmap(self, image, pointmap=None, intrinsics=None):
+         loaded_image = self.image_to_float(image)
+         loaded_image = torch.from_numpy(loaded_image)
+         loaded_mask = loaded_image[..., -1]
+@@ -288,8 +288,10 @@ class InferencePipelinePointMap(InferencePipeline):
+                     size=(loaded_image.shape[1], loaded_image.shape[2]),
+                     mode="nearest",
+                 ).squeeze(0).permute(1, 2, 0)
+-            intrinsics = None
+-        
++            # GT-intrinsics patch: with an external pointmap, keep the
++            # caller-provided `intrinsics` (ground-truth camera parameters)
++            # if given; fall back to inference below only when it is None.
++
+         # Prepare the point map tensor
+         point_map_tensor = {
+             "pts_color": loaded_image,
+@@ -308,7 +310,10 @@ class InferencePipelinePointMap(InferencePipeline):
+             )
+             point_map_tensor["intrinsics"] = intrinsics_result["intrinsics"]
+         else:
+-            point_map_tensor["intrinsics"] = intrinsics
++            # GT-intrinsics patch: accept a numpy array or a tensor on any device.
++            if isinstance(intrinsics, np.ndarray):
++                intrinsics = torch.from_numpy(intrinsics).float()
++            point_map_tensor["intrinsics"] = intrinsics.to(self.device)
+ 
+         points_tensor = points_tensor.permute(2, 0, 1)
+         points_tensor = self._clip_pointmap(points_tensor, loaded_mask)
+@@ -397,12 +402,13 @@ class InferencePipelinePointMap(InferencePipeline):
+         use_stage1_distillation=False,
+         use_stage2_distillation=False,
+         pointmap=None,
++        intrinsics=None,
+         decode_formats=None,
+         estimate_plane=False,
+     ) -> dict:
+         image = self.merge_image_and_mask(image, mask)
+-        with self.device: 
+-            pointmap_dict = self.compute_pointmap(image, pointmap)
++        with self.device:
++            pointmap_dict = self.compute_pointmap(image, pointmap, intrinsics)
+             pointmap = pointmap_dict["pointmap"]
+             pts = type(self)._down_sample_img(pointmap)
+             pts_colors = type(self)._down_sample_img(pointmap_dict["pts_color"])
