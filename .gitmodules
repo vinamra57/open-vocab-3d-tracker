@@ -9,3 +9,6 @@
 	path = third_party/sam-3d-objects
 	url = https://github.com/facebookresearch/sam-3d-objects.git
 	ignore = dirty
+[submodule "third_party/FoundationPose"]
+	path = third_party/FoundationPose
+	url = https://github.com/NVlabs/FoundationPose.git
