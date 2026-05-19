@@ -488,38 +488,82 @@ def rank_top_k(image_per_frame: dict, k: int = 10) -> list[dict]:
     return scored[:k]
 
 
+def _render_overlay_frame(frame: np.ndarray, entry: dict, idx: int,
+                          best_frame) -> np.ndarray:
+    """Draw the mask overlay (fill + contour) and a frame label onto a BGR frame."""
+    rle = entry.get("mask_rle")
+    if rle is not None:
+        mask = decode_mask_rle(rle)
+        overlay = frame.copy()
+        overlay[mask] = (0, 200, 0)
+        frame = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
+        contours, _ = cv2.findContours(mask.astype(np.uint8),
+                                       cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(frame, contours, -1, (0, 255, 0), 2)
+    tag = f"frame {idx}"
+    if idx == best_frame:
+        tag += "  [SEED]"
+    elif rle is None:
+        tag += "  [no mask]"
+    cv2.putText(frame, tag, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(frame, tag, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                (255, 255, 255), 1, cv2.LINE_AA)
+    return frame
+
+
 def write_viz(frames_dir: Path, per_frame: dict, num_frames: int,
               best_frame, fps: float, viz_path: Path) -> None:
-    """Render a mask-overlay preview MP4."""
+    """Render a mask-overlay preview MP4.
+
+    Encodes H.264 (yuv420p) via ffmpeg when available. OpenCV's built-in
+    ``mp4v`` writer emits an MPEG-4 Part 2 stream that many players (browsers,
+    QuickTime, IDE preview panes) render with green / corrupt frames, so ffmpeg
+    is strongly preferred; the ``mp4v`` writer is only a fallback for when
+    ffmpeg is not installed.
+    """
+    import shutil
+    import subprocess
+
     viz_path.parent.mkdir(parents=True, exist_ok=True)
     first = cv2.imread(str(frames_dir / "000000.jpg"))
     H, W = first.shape[:2]
-    writer = cv2.VideoWriter(str(viz_path), cv2.VideoWriter_fourcc(*"mp4v"),
-                             max(fps, 1.0), (W, H))
+    fps = max(float(fps), 1.0)
+
+    ffmpeg = shutil.which("ffmpeg")
+    proc = writer = None
+    if ffmpeg:
+        # Pipe raw BGR frames straight into ffmpeg -> H.264 (plays everywhere).
+        proc = subprocess.Popen(
+            [ffmpeg, "-y", "-loglevel", "error",
+             "-f", "rawvideo", "-pixel_format", "bgr24",
+             "-video_size", f"{W}x{H}", "-framerate", f"{fps:.4f}", "-i", "-",
+             "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+             "-movflags", "+faststart", str(viz_path)],
+            stdin=subprocess.PIPE)
+    else:
+        writer = cv2.VideoWriter(str(viz_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                                 fps, (W, H))
+
     for idx in range(num_frames):
         frame = cv2.imread(str(frames_dir / f"{idx:06d}.jpg"))
-        entry = per_frame.get(str(idx), {})
-        rle = entry.get("mask_rle")
-        if rle is not None:
-            mask = decode_mask_rle(rle)
-            overlay = frame.copy()
-            overlay[mask] = (0, 200, 0)
-            frame = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
-            contours, _ = cv2.findContours(mask.astype(np.uint8),
-                                           cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(frame, contours, -1, (0, 255, 0), 2)
-        tag = f"frame {idx}"
-        if idx == best_frame:
-            tag += "  [SEED]"
-        elif rle is None:
-            tag += "  [no mask]"
-        cv2.putText(frame, tag, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                    (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(frame, tag, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                    (255, 255, 255), 1, cv2.LINE_AA)
-        writer.write(frame)
-    writer.release()
-    log(f"wrote overlay preview -> {viz_path}")
+        frame = _render_overlay_frame(frame, per_frame.get(str(idx), {}),
+                                      idx, best_frame)
+        if proc is not None:
+            proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+        else:
+            writer.write(frame)
+
+    if proc is not None:
+        proc.stdin.close()
+        if proc.wait() != 0:
+            raise RuntimeError(f"ffmpeg encoding failed (exit {proc.returncode})")
+        log(f"wrote overlay preview (H.264) -> {viz_path}")
+    else:
+        writer.release()
+        log(f"wrote overlay preview (mp4v fallback; install ffmpeg for H.264) "
+            f"-> {viz_path}")
 
 
 # ---------------------------------------------------------------------------
