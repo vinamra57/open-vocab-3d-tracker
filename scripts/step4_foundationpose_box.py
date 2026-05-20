@@ -386,22 +386,34 @@ def split_segments(frames: list, frame_stride: int) -> list:
 # ---------------------------------------------------------------------------
 # Per-video processing
 # ---------------------------------------------------------------------------
-def process_video(args) -> int:
-    step1_dir = args.step1_dir.resolve()
-    step2_dir = args.step2_dir.resolve()
-    step3_dir = args.step3_dir.resolve()
+def run_video(args, tracker, *, step1_dir, step2_dir, step3_dir, out_dir,
+              video_name=None) -> dict:
+    """Per-video FoundationPose pipeline. Reuses the passed `tracker` -- the
+    caller owns the FP import and model load, so many videos can share one
+    tracker (the production wrapper uses this).
+
+    Writes atomic outputs to `out_dir` and touches ``<out_dir>/.done`` last;
+    `.done`'s presence is the resume marker. Returns a dict
+    ``{status, video_name, out_dir, counts, num_frames, elapsed_sec}``.
+    """
+    step1_dir = Path(step1_dir).resolve()
+    step2_dir = Path(step2_dir).resolve()
+    step3_dir = Path(step3_dir).resolve()
+    out_dir = Path(out_dir).resolve()
     for d, name in [(step1_dir, "step1"), (step2_dir, "step2"), (step3_dir, "step3")]:
         if not d.is_dir():
-            sys.exit(f"FATAL: --{name}_dir does not exist: {d}")
+            raise FileNotFoundError(f"--{name}_dir does not exist: {d}")
 
     step3_meta = json.loads((step3_dir / "meta.json").read_text())
-    video_name = step3_meta.get("video_name") or step3_dir.name
+    if video_name is None:
+        video_name = step3_meta.get("video_name") or step3_dir.name
     frame_stride = int(step3_meta.get("frame_stride") or 1)
     target_fps = float(step3_meta.get("target_fps") or 5.0)
 
-    out_dir = (args.output_dir / video_name).resolve()
-    if (out_dir / "meta.json").exists() and not args.overwrite:
-        sys.exit(f"{out_dir}/meta.json already exists -- pass --overwrite to redo.")
+    done_marker = out_dir / ".done"
+    if done_marker.exists() and not args.overwrite:
+        return {"status": "skipped", "video_name": video_name,
+                "out_dir": str(out_dir), "counts": {}, "num_frames": 0}
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 2 masks (keyed by frame-index string).
@@ -413,13 +425,10 @@ def process_video(args) -> int:
     if args.max_frames > 0:
         meshed = meshed[:args.max_frames]
     if not meshed:
-        sys.exit("FATAL: Step 3 produced no meshes -- nothing for Step 4 to do.")
+        return {"status": "empty", "video_name": video_name,
+                "out_dir": str(out_dir), "counts": {}, "num_frames": 0}
     segments = split_segments(meshed, frame_stride)
     log(f"{video_name}: {len(meshed)} meshed frames in {len(segments)} segment(s)")
-
-    _import_foundationpose(args.fp_repo, args.fp_verbose)
-    set_seed(args.seed)
-    tracker = FPTracker(debug=args.debug, debug_dir=out_dir / "_fp_debug")
 
     results: dict = {}     # source_frame_index -> per-frame output record
     pose_last_store: dict = {}  # source_frame_index -> centered-mesh pose (np 4x4)
@@ -572,10 +581,43 @@ def process_video(args) -> int:
     write_outputs(args, out_dir, video_name, step1_dir, step2_dir, step3_dir,
                   step3_meta, frame_stride, target_fps, frames_out, counts, elapsed)
 
-    log(f"Done in {elapsed/60:.1f} min: {counts}")
+    log(f"{video_name}: done in {elapsed/60:.1f} min: {counts}")
     if args.save_viz:
         render_viz(out_dir, step1_dir, frames_out, target_fps)
-    return counts["error"]
+
+    # `.done` last -- atomic indicator that this video is finished.
+    done_marker.write_text("")
+    return {"status": "ok", "video_name": video_name, "out_dir": str(out_dir),
+            "counts": counts, "num_frames": len(frames_out),
+            "elapsed_sec": round(elapsed, 1)}
+
+
+def process_video(args) -> int:
+    """CLI entrypoint: import FP, create a tracker, run one video.
+
+    The path layout is ``<output_dir>/<video_name>/``, where ``video_name``
+    comes from the Step 3 meta.json. Multi-object / multi-video production
+    uses `run_video` directly with one tracker shared across videos -- see
+    `step4_foundationpose_box_production.py`.
+    """
+    step3_dir = args.step3_dir.resolve()
+    if not (step3_dir / "meta.json").is_file():
+        sys.exit(f"FATAL: Step 3 meta.json not found at {step3_dir}")
+    step3_meta = json.loads((step3_dir / "meta.json").read_text())
+    video_name = step3_meta.get("video_name") or step3_dir.name
+    out_dir = (args.output_dir / video_name).resolve()
+    _import_foundationpose(args.fp_repo, args.fp_verbose)
+    set_seed(args.seed)
+    tracker = FPTracker(debug=args.debug, debug_dir=out_dir / "_fp_debug")
+    result = run_video(args, tracker,
+                       step1_dir=args.step1_dir, step2_dir=args.step2_dir,
+                       step3_dir=args.step3_dir, out_dir=out_dir,
+                       video_name=video_name)
+    if result["status"] == "skipped":
+        sys.exit(f"{out_dir}/.done already exists -- pass --overwrite to redo.")
+    if result["status"] == "empty":
+        sys.exit("FATAL: Step 3 produced no meshes -- nothing for Step 4 to do.")
+    return result["counts"].get("error", 0)
 
 
 def _frame_id(rec: dict) -> dict:
@@ -634,15 +676,23 @@ def write_outputs(args, out_dir, video_name, step1_dir, step2_dir, step3_dir,
         },
         "frames": frames_out,
     }
-    (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    # Atomic write: tmp + os.replace, so a partial write is never visible.
+    meta_path = out_dir / "meta.json"
+    meta_tmp = meta_path.with_suffix(".json.tmp")
+    meta_tmp.write_text(json.dumps(meta, indent=2))
+    os.replace(meta_tmp, meta_path)
 
-    # Convenience array: (N, 8, 3) world-frame corners (NaN where unavailable).
     boxes_world = np.full((len(frames_out), 8, 3), np.nan, dtype=np.float32)
     for i, fr in enumerate(frames_out):
         cw = fr.get("box", {}).get("corners_world") if fr.get("status") == "ok" else None
         if cw is not None:
             boxes_world[i] = np.asarray(cw, dtype=np.float32)
-    np.save(out_dir / "boxes_world.npy", boxes_world)
+    # np.save auto-appends .npy if the suffix isn't already .npy, so pick a
+    # tmp name that *also* ends in .npy.
+    boxes_path = out_dir / "boxes_world.npy"
+    boxes_tmp = out_dir / "boxes_world.tmp.npy"
+    np.save(boxes_tmp, boxes_world)
+    os.replace(boxes_tmp, boxes_path)
     log(f"Wrote {out_dir}/meta.json + boxes_world.npy ({len(frames_out)} frames)")
 
 
