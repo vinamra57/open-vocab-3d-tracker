@@ -379,7 +379,18 @@ def prepare_frame(step1: dict, step2: dict, j2: int, max_depth: float):
 
     j1 = step1["index_by_src"].get(src)
     if j1 is None:
-        return "no_step1_frame"
+        # Positional fallback: Step 1 and Step 2 may label their per-frame
+        # source differently while ordering the same physical frames the
+        # same way -- in CA-1M production, Step 1 stores integer frame
+        # indices `[0, 1, ..., N-1]` while Step 2 stores ns timestamps
+        # `[4144648974458, ...]`. Same frames, same order, different labels.
+        # When the two lists are the same length we trust position over
+        # label lookup. (Dev paths with matching labels hit the fast
+        # `index_by_src` path above and never reach this branch.)
+        if len(step1["src_indices"]) == len(step2["src_indices"]):
+            j1 = j2
+        else:
+            return "no_step1_frame"
 
     depth_path = step1["dir"] / "depth" / f"{j1:06d}.npy"
     rgb_path = step1["dir"] / "frames" / f"{j1:06d}.jpg"
